@@ -241,4 +241,8 @@ test.sqlite3-wal
 cline.mcp.json
 opencode.json
 windsurf.mcp.json
+codex.mcp.json
+cursor.mcp.json
+gemini.mcp.json
+.mcp.json
 .vscode/
