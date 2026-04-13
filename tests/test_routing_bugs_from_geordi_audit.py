@@ -101,15 +101,24 @@ async def test_reply_to_own_outbound_defaults_to_original_recipients(isolated_en
         )
         reply_deliveries = rep.data.get("deliveries") or []
         assert reply_deliveries, "reply_message returned no deliveries"
-        # The reply MUST go to Adama (original recipient), not back to Geordi.
-        reply_to_names: list[str] = reply_deliveries[0]["payload"].get("to", [])
-        assert "Geordi" not in reply_to_names, (
-            f"Self-reply loop: reply_to={reply_to_names}. "
-            f"Expected Adama as recipient, got Geordi (self)."
+        # The reply MUST go to Adama (original recipient) AT servitor, not
+        # back to Geordi. Check EVERY delivery, not just deliveries[0] —
+        # a shadow-local delivery landing first would still fail the bug.
+        delivery_projects = [d.get("project") for d in reply_deliveries]
+        assert any(p in ("Servitor", "servitor") for p in delivery_projects), (
+            f"Reply did not land at Servitor project. deliveries={reply_deliveries}"
         )
-        assert "Adama" in reply_to_names, (
-            f"Expected Adama in recipients, got {reply_to_names}"
+        assert not any(p in ("Geordi-Home", "geordi") for p in delivery_projects), (
+            f"Reply leaked a Geordi-local delivery (self-loop). deliveries={reply_deliveries}"
         )
+        for d in reply_deliveries:
+            reply_to_names: list[str] = d["payload"].get("to", [])
+            assert "Geordi" not in reply_to_names, (
+                f"Self-reply loop in {d.get('project')}: reply_to={reply_to_names}."
+            )
+            assert "Adama" in reply_to_names, (
+                f"Expected Adama in recipients of {d.get('project')} delivery, got {reply_to_names}"
+            )
 
 
 @pytest.mark.asyncio
@@ -141,8 +150,40 @@ async def test_macro_contact_handshake_welcome_sends_cross_project(isolated_env)
         # And it should have been delivered to the Servitor project
         welcome = res.data["welcome_message"]
         deliveries = welcome.get("deliveries") or []
-        assert any(d.get("project") in ("Servitor", "servitor") for d in deliveries), (
+        delivery_projects = [d.get("project") for d in deliveries]
+        assert any(p in ("Servitor", "servitor") for p in delivery_projects), (
             f"Welcome not delivered to Servitor project. deliveries={deliveries}"
+        )
+        assert not any(p in ("Geordi-Home", "geordi") for p in delivery_projects), (
+            f"Welcome leaked a Geordi-local shadow delivery. deliveries={deliveries}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_message_to_project_whitespace_only_rejected(isolated_env):
+    """Bug 3 edge case (Codex review): whitespace-only `to_project` must
+    fail loud, not silently no-op. Silent no-op would route to sender's
+    local project — exactly the shadow-drop failure we're fixing."""
+    await _seed_cross_project_link(
+        "geordi", "Geordi-Home", "Geordi",
+        "servitor", "Servitor", "Adama",
+    )
+    server = build_mcp_server()
+    async with Client(server) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "geordi",
+                    "sender_name": "Geordi",
+                    "to": ["Adama"],
+                    "to_project": "   ",
+                    "subject": "x",
+                    "body_md": "y",
+                },
+            )
+        assert "INVALID_ARGUMENT" in str(excinfo.value) or "to_project" in str(excinfo.value), (
+            f"Expected INVALID_ARGUMENT / to_project error, got: {excinfo.value}"
         )
 
 
