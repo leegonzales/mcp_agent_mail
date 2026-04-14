@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,8 @@ from decouple import (  # type: ignore[import-untyped,attr-defined]
     RepositoryEmpty,
     RepositoryEnv,
 )
+
+logger = logging.getLogger(__name__)
 
 _DOTENV_PATH: Final[Path] = Path(".env")
 # Gracefully handle missing .env (e.g., in CI/tests) by falling back to an empty repository
@@ -283,7 +286,7 @@ def get_settings() -> Settings:
             return v
         return "coerce"
 
-    return Settings(
+    settings = Settings(
         environment=environment,
         # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
         worktrees_enabled=(
@@ -332,8 +335,18 @@ def get_settings() -> Settings:
         ),
         agent_name_enforcement_mode=_agent_name_mode(_decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="coerce")),
         messaging_auto_register_recipients=_bool(_decouple_config("MESSAGING_AUTO_REGISTER_RECIPIENTS", default="true"), default=True),
-        messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="true"), default=True),
+        messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="false"), default=False),
     )
+    # Loud startup warning if the silent-handshake-on-block anti-pattern has
+    # been explicitly re-enabled by the operator.
+    if settings.messaging_auto_handshake_on_block:
+        logger.warning(
+            "messaging_auto_handshake_on_block=True re-enables the silent "
+            "handshake-on-block anti-pattern (deprecated). Prefer explicit "
+            "macro_contact_handshake() before send_message. See "
+            "docs/deprecation-auto-contact-if-blocked.md"
+        )
+    return settings
 
 
 def clear_settings_cache() -> None:

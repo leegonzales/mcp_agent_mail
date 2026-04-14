@@ -3400,6 +3400,84 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
+    @mcp.tool(name="list_agents")
+    @_instrument_tool("list_agents", cluster=CLUSTER_IDENTITY, capabilities={"identity", "audit"}, project_arg="project_key")
+    async def list_agents(
+        ctx: Context,
+        project_key: str,
+    ) -> dict[str, Any]:
+        """
+        Diagnostic: list agents registered to a project plus shadow candidates.
+
+        Shadow candidates are local agents whose name ALSO exists in at least
+        one other project — a likely fingerprint of the historical silent
+        shadow-create path. Read-only.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+
+        Returns
+        -------
+        dict
+            {
+              "project_key": str,
+              "local": [{name, id, project_slug}],
+              "shadow_candidates": [{name, also_at: [project_slug, ...]}]
+            }
+        """
+        project = await _get_project_by_identifier(project_key)
+        async with get_session() as session:
+            local_rows = await session.execute(
+                select(Agent)
+                .where(cast(Any, Agent.project_id == project.id))
+                .order_by(Agent.name)
+            )
+            local_agents = list(local_rows.scalars().all())
+
+            # Single bulk query for shadow candidates: find every other
+            # project where any of our local names also lives. Previously
+            # ran one query per local agent (N+1); now one query total.
+            shadow_candidates: list[dict[str, Any]] = []
+            if local_agents:
+                local_names_lower = [a.name.lower() for a in local_agents]
+                other_rows = await session.execute(
+                    select(Project.slug, Agent.name)
+                    .join(Agent, cast(Any, Agent.project_id == Project.id))
+                    .where(
+                        cast(Any, func.lower(Agent.name).in_(local_names_lower)),
+                        cast(Any, Project.id != project.id),
+                    )
+                    .order_by(Project.slug)
+                )
+                buckets: dict[str, list[str]] = {}
+                for proj_slug, agent_name in other_rows.all():
+                    buckets.setdefault(agent_name.lower(), []).append(proj_slug)
+                # Preserve local-order (alphabetical by Agent.name) and
+                # original-case agent name in the output.
+                for a in local_agents:
+                    also_at = buckets.get(a.name.lower(), [])
+                    if also_at:
+                        # Dedup + deterministic order (bulk query already
+                        # orders by Project.slug, but duplicate matches can
+                        # occur if the same project has two case-variants).
+                        deduped = sorted(set(also_at))
+                        shadow_candidates.append({"name": a.name, "also_at": deduped})
+
+        await ctx.info(
+            f"list_agents '{project.human_key}' -> {len(local_agents)} local, "
+            f"{len(shadow_candidates)} shadow candidates"
+        )
+        return {
+            "project_key": project.human_key or project.slug,
+            "local": [
+                {"name": a.name, "id": a.id, "project_slug": project.slug}
+                for a in local_agents
+            ],
+            "shadow_candidates": shadow_candidates,
+        }
+
     @mcp.tool(name="create_agent_identity")
     @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
     async def create_agent_identity(
@@ -3607,6 +3685,13 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        if auto_contact_if_blocked:
+            logger.warning(
+                "auto_contact_if_blocked=True is deprecated and will be "
+                "removed in a future release. Use macro_contact_handshake() "
+                "up front to establish contact before sending. See "
+                "docs/deprecation-auto-contact-if-blocked.md"
+            )
         project = await _get_project_by_identifier(project_key)
 
         # Normalize 'to' parameter - accept single string and convert to list
@@ -4045,6 +4130,11 @@ def build_mcp_server() -> FastMCP:
                 return trimmed or value, keys, canonical
 
             unknown_local: set[str] = set()
+            # Track the original kind ("to"/"cc"/"bcc") for each unknown_local
+            # name so downstream resolution (auto-register, found_globally
+            # AgentLink) can dispatch to the correct local_to/local_cc/local_bcc
+            # bucket instead of promoting everything to TO (gemini #5).
+            unknown_local_kinds: dict[str, str] = {}
             unknown_external: dict[str, list[str]] = defaultdict(list)
 
             class _ContactBlocked(Exception):
@@ -4092,7 +4182,11 @@ def build_mcp_server() -> FastMCP:
                             label = target_project_label or "(unknown project)"
                             unknown_external[label].append(candidate.strip() or candidate)
                         else:
-                            unknown_local.add(candidate.strip() or candidate)
+                            display = candidate.strip() or candidate
+                            unknown_local.add(display)
+                            # First kind wins on dup names — tie-break ordering
+                            # to/cc/bcc by appearance in _route call order.
+                            unknown_local_kinds.setdefault(display, kind)
                         continue
 
                     # Always allow self-send (local context only)
@@ -4168,7 +4262,9 @@ def build_mcp_server() -> FastMCP:
                         label = target_project_label or "(unknown project)"
                         unknown_external[label].append(display_value or candidate.strip() or candidate)
                     else:
-                        unknown_local.add(display_value or candidate.strip() or candidate)
+                        display = display_value or candidate.strip() or candidate
+                        unknown_local.add(display)
+                        unknown_local_kinds.setdefault(display, kind)
 
             try:
                 await _route(to, "to")
@@ -4182,26 +4278,187 @@ def build_mcp_server() -> FastMCP:
                 ) from err
 
             if unknown_local or unknown_external:
-                # Auto-register missing local recipients if enabled
-                if getattr(settings_local, "messaging_auto_register_recipients", True):
-                    # Best effort: try to register any unknown local recipients with sane defaults
-                    # BUT: check globally first to prevent ghost registrations.
-                    # If an agent exists on another project, skip local registration —
-                    # _get_agent_global will resolve correctly at delivery time.
-                    newly_registered: set[str] = set()
-                    found_globally: set[str] = set()
-                    for missing in list(unknown_local):
-                        try:
-                            existing = await _find_agent_globally(missing)
-                            if existing:
-                                # Agent exists on another project — no ghost needed
-                                found_globally.add(missing)
-                                await ctx.info(
-                                    f"[note] '{missing}' not in local project but found globally "
-                                    f"(project_id={existing.project_id}). Skipping local registration."
+                # INVARIANT (hoisted): any `unknown_local` name that exists on
+                # another project without an approved AgentLink from the
+                # sender MUST fail loud with RECIPIENT_NOT_FOUND, regardless
+                # of `messaging_auto_register_recipients`. Auto-register is an
+                # ergonomic shortcut for genuinely new names — it must never
+                # be used to shadow-deliver to a real agent that lives
+                # elsewhere.
+                found_globally: set[str] = set()
+                globally_unlinked: dict[str, list[str]] = {}
+                if unknown_local:
+                    lowered_to_original: dict[str, str] = {
+                        name.lower(): name for name in unknown_local
+                    }
+                    lowered_names = list(lowered_to_original.keys())
+                    # Bucket: lowered_name -> list[(Agent, Project)] for all
+                    # hits across the fleet. Built from a SINGLE query.
+                    hits_by_name: dict[str, list[tuple[Agent, Project]]] = {}
+                    # Flat list of matched agent ids, used for a SINGLE bulk
+                    # AgentLink query below.
+                    hit_agent_ids: list[int] = []
+                    # Sender-visible projects: every project the sender has
+                    # at least one approved AgentLink into. Used to scope the
+                    # RECIPIENT_NOT_FOUND `found_at_projects` payload so we
+                    # don't enumerate unrelated projects across tenants
+                    # (Gemini round-3 #2 [security]).
+                    sender_visible_project_ids: set[int] = set()
+                    async with get_session() as s_scan:
+                        # (1) Single bulk lookup for ALL unknown_local names.
+                        # Exclude the sender's own project — local agents are
+                        # legitimate locally and must never be flagged as
+                        # globally_unlinked (Gemini round-3 #1).
+                        rows = await s_scan.execute(
+                            select(Agent, Project)
+                            .join(Project, cast(Any, Project.id == Agent.project_id))
+                            .where(
+                                cast(Any, func.lower(Agent.name).in_(lowered_names)),
+                                cast(Any, Project.id != project.id),
+                            )
+                            .order_by(Project.slug)
+                        )
+                        for agent_row, proj_row in rows.all():
+                            key = agent_row.name.lower()
+                            hits_by_name.setdefault(key, []).append((agent_row, proj_row))
+                            if agent_row.id is not None:
+                                hit_agent_ids.append(agent_row.id)
+
+                        # (2) Single bulk AgentLink query for every candidate
+                        # target agent — approved links from this sender only.
+                        approved_target_ids: set[int] = set()
+                        if hit_agent_ids:
+                            link_rows = await s_scan.execute(
+                                select(AgentLink.b_agent_id)
+                                .where(  # type: ignore[arg-type]
+                                    cast(Any, AgentLink.a_project_id) == project.id,
+                                    cast(Any, AgentLink.a_agent_id) == sender.id,
+                                    cast(Any, AgentLink.status == "approved"),
+                                    cast(Any, AgentLink.b_agent_id.in_(hit_agent_ids)),
                                 )
-                                continue
-                            # Truly unknown agent — auto-register in sender's project
+                            )
+                            approved_target_ids = {
+                                bid for (bid,) in link_rows.all() if bid is not None
+                            }
+
+                        # (3) Sender's full visibility set — every project
+                        # they have any approved AgentLink into. ONE query.
+                        vis_rows = await s_scan.execute(
+                            select(AgentLink.b_project_id)
+                            .where(  # type: ignore[arg-type]
+                                cast(Any, AgentLink.a_project_id) == project.id,
+                                cast(Any, AgentLink.a_agent_id) == sender.id,
+                                cast(Any, AgentLink.status == "approved"),
+                            )
+                            .distinct()
+                        )
+                        sender_visible_project_ids = {
+                            pid for (pid,) in vis_rows.all() if pid is not None
+                        }
+
+                    # (3) In-memory classification — zero queries.
+                    for lower_name, hits in hits_by_name.items():
+                        original = lowered_to_original.get(lower_name, lower_name)
+                        approved = any(a.id in approved_target_ids for a, _p in hits)
+                        if approved:
+                            found_globally.add(original)
+                            await ctx.info(
+                                f"[note] '{original}' resolved via approved AgentLink. "
+                                "Skipping local registration."
+                            )
+                            continue
+                        # Globally visible but unlinked — fail-loud.
+                        # SECURITY (Gemini round-3 #2): only enumerate
+                        # projects the sender already has approved AgentLinks
+                        # into. If they have none, return an empty list and
+                        # let the hint text guide them to use `to_project`
+                        # or run an explicit handshake. Use human_key when
+                        # available, else fall back to slug (M2).
+                        visible_hits = [
+                            (a, proj) for a, proj in hits
+                            if proj.id in sender_visible_project_ids
+                        ]
+                        labels = sorted({
+                            (proj.human_key or proj.slug) for _a, proj in visible_hits
+                        })
+                        globally_unlinked[original] = labels
+
+                if globally_unlinked:
+                    def _hint_for(projs: list[str]) -> str:
+                        if projs:
+                            return (
+                                "Use to_project=<project_key> to disambiguate, or "
+                                "call macro_contact_handshake to establish a contact link."
+                            )
+                        return (
+                            "An agent with this name exists in one or more "
+                            "other projects you don't have visibility into. "
+                            "Use `to_project` if you know the target project, "
+                            "or ask an operator to set up an explicit handshake."
+                        )
+
+                    unknown_payload = [
+                        {
+                            "name": name,
+                            "found_at_projects": projects,
+                            "hint": _hint_for(projects),
+                        }
+                        for name, projects in sorted(globally_unlinked.items())
+                    ]
+                    # Only suggest handshake calls when we have a target
+                    # project to point at — otherwise we'd leak project ids
+                    # via the suggestion payload (Gemini round-3 #2).
+                    suggested = [
+                        {
+                            "tool": "macro_contact_handshake",
+                            "arguments": {
+                                # Fall back to slug when human_key is None (M2).
+                                "project_key": project.human_key or project.slug,
+                                "requester": sender.name,
+                                "target": name,
+                                "to_project": projects[0],
+                                "auto_accept": False,
+                            },
+                        }
+                        for name, projects in sorted(globally_unlinked.items())
+                        if projects
+                    ]
+                    # Render per-recipient project list into the message so the
+                    # fail-loud is observable end-to-end (even through the MCP
+                    # client wrapper that strips structured data). When the
+                    # visible-projects list is empty (sender has no AgentLinks
+                    # to any project where the name lives), show "no visible
+                    # project" so the failure mode is still legible without
+                    # leaking unrelated slugs.
+                    def _render_projects(projs: list[str]) -> str:
+                        return f"[{', '.join(projs)}]" if projs else "[no visible project]"
+                    rendered = "; ".join(
+                        f"{name} @ {_render_projects(projects)}"
+                        for name, projects in sorted(globally_unlinked.items())
+                    )
+                    raise ToolExecutionError(
+                        "RECIPIENT_NOT_FOUND",
+                        (
+                            "Recipient(s) exist in other projects but no approved "
+                            f"contact link is in place: {rendered}. "
+                            "Use `to_project` or `macro_contact_handshake` to route correctly."
+                        ),
+                        recoverable=True,
+                        data={
+                            "unknown_recipients": unknown_payload,
+                            "suggested_tool_calls": suggested,
+                        },
+                    )
+
+                # Auto-register truly-unknown local recipients if enabled.
+                # At this point, any unknown_local names are either
+                # genuinely new (no global match) or resolved via AgentLink.
+                newly_registered: set[str] = set()
+                if getattr(settings_local, "messaging_auto_register_recipients", True):
+                    for missing in list(unknown_local):
+                        if missing in found_globally:
+                            continue
+                        try:
                             _ = await _get_or_create_agent(
                                 project,
                                 missing,
@@ -4213,25 +4470,45 @@ def build_mcp_server() -> FastMCP:
                             newly_registered.add(missing)
                         except Exception:
                             pass
-                    unknown_local.difference_update(newly_registered)
-                    unknown_local.difference_update(found_globally)
-                    # Re-run routing for newly registered agents
-                    if newly_registered:
-                        from contextlib import suppress
-                        with suppress(_ContactBlocked):
-                            await _route(list(newly_registered), "to")
-                    # For globally-found agents, add directly to local_to —
-                    # _persist_message resolves via _get_agent_global.
-                    # Dedup against external to prevent double delivery (review C1).
-                    if found_globally:
-                        external_names = {
-                            nm.lower()
-                            for group in external.values()
-                            for nm in group.get("to", []) + group.get("cc", []) + group.get("bcc", [])
-                        } if external else set()
-                        for name in found_globally:
-                            if name.lower() not in external_names:
-                                local_to.append(name)
+                unknown_local.difference_update(newly_registered)
+                unknown_local.difference_update(found_globally)
+
+                # Helper: dispatch a resolved name into the local bucket
+                # matching the kind it was originally specified in
+                # ("to"/"cc"/"bcc"). Defaults to "to" only as a last resort
+                # if kind tracking somehow missed the name (shouldn't happen
+                # under normal flow). Replaces the legacy recursive
+                # `_route(...)` re-entry which would have re-triggered the
+                # hoisted invariant against the just-created local row
+                # (gemini #3) AND silently promoted CC/BCC to TO (gemini #5).
+                def _dispatch_local(name: str) -> None:
+                    k = unknown_local_kinds.get(name, "to")
+                    if k == "cc":
+                        local_cc.append(name)
+                    elif k == "bcc":
+                        local_bcc.append(name)
+                    else:
+                        local_to.append(name)
+
+                # Auto-registered new local agents: deliver them in the
+                # original kind, no recursion into _route.
+                for name in sorted(newly_registered):
+                    _dispatch_local(name)
+
+                # For globally-found (AgentLink-approved) recipients, add
+                # to the appropriate local bucket — _persist_message
+                # resolves via _get_agent_global. Dedup against external
+                # to prevent double delivery (review C1). Runs regardless
+                # of auto-register config.
+                if found_globally:
+                    external_names = {
+                        nm.lower()
+                        for group in external.values()
+                        for nm in group.get("to", []) + group.get("cc", []) + group.get("bcc", [])
+                    } if external else set()
+                    for name in sorted(found_globally):
+                        if name.lower() not in external_names:
+                            _dispatch_local(name)
                 # Attempt cross-project handshakes for unknown external recipients if allowed
                 attempted_external: list[str] = []
                 try:

@@ -41,7 +41,13 @@ async def test_contact_policy_block_all_blocks_direct_message(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_contacts_only_requires_approval_then_allows(isolated_env):
+async def test_contacts_only_requires_approval_then_allows(isolated_env, monkeypatch):
+    # Relies on legacy silent-handshake-on-block to escalate contacts_only
+    # blocks into a successful send. Default flipped to False 2026-04;
+    # opt back in for the legacy contract.
+    from mcp_agent_mail import config as _config
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
+    _config.clear_settings_cache()
     server = build_mcp_server()
 
     async with Client(server) as client:

@@ -16,6 +16,11 @@ from mcp_agent_mail.utils import slugify
 async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
     # Ensure contact enforcement is enabled (it is by default, but be explicit)
     monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")
+    # The contacts_only branch of this test relies on the legacy
+    # silent-handshake-on-block behavior to resolve contact approval as a
+    # side-effect of send. The default flipped to False as of 2026-04 (least
+    # astonishment); opt back in for this legacy contract test.
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
 

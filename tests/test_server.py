@@ -240,6 +240,11 @@ async def test_file_reservation_enforcement_blocks_message_on_overlap(isolated_e
 async def test_force_release_file_reservation_stale(isolated_env, monkeypatch):
     monkeypatch.setenv("FILE_RESERVATION_INACTIVITY_SECONDS", "5")
     monkeypatch.setenv("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "1")
+    # `notified=True` requires the force_release notification message to be
+    # delivered, which depends on the legacy silent-handshake-on-block path
+    # to escalate the contacts_only block into a successful send. Default
+    # flipped to False 2026-04; opt back in for this legacy contract.
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
     clear_settings_cache()
     try:
         server = build_mcp_server()
