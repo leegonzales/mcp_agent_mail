@@ -34,21 +34,15 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
 
-        # Unknown recipient returns structured error
-        with pytest.raises(ToolError):
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": "Backend",
-                    "sender_name": "GreenCastle",
-                    "to": ["BlueLake"],
-                    "subject": "Hello",
-                    "body_md": "testing unknown recipient",
-                },
-            )
-
-        # Retrieve again via non-raising call — implementation may auto-handshake;
-        # accept either structured error or success
+        # Unknown recipient: under the contract introduced by
+        # fix/step-2-shadow-create-root-cause + the kind-aware
+        # auto-register fix (gemini round-3 #3), a name with no global
+        # match gets auto-registered locally AND actually delivered in
+        # the same call. The legacy behavior of raising
+        # CONTACT_REQUIRED here was a downstream side-effect of the
+        # broken recursive re-route — that's gone. We accept either
+        # outcome (structured error OR success) here, since
+        # `messaging_auto_register_recipients` is operator-controlled.
         res = await client.call_tool_mcp(
             "send_message",
             {
