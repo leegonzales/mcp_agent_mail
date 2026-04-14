@@ -4253,59 +4253,115 @@ def build_mcp_server() -> FastMCP:
                 ) from err
 
             if unknown_local or unknown_external:
-                # Auto-register missing local recipients if enabled
-                if getattr(settings_local, "messaging_auto_register_recipients", True):
-                    # Best effort: try to register any unknown local recipients with sane defaults
-                    # BUT: check globally first to prevent ghost registrations.
-                    # If an agent exists on another project, skip local registration —
-                    # _get_agent_global will resolve correctly at delivery time.
-                    newly_registered: set[str] = set()
-                    found_globally: set[str] = set()
-                    # Map name -> [project_keys] for globally-visible unlinked recipients.
-                    globally_unlinked: dict[str, list[str]] = {}
+                # INVARIANT (hoisted): any `unknown_local` name that exists on
+                # another project without an approved AgentLink from the
+                # sender MUST fail loud with RECIPIENT_NOT_FOUND, regardless
+                # of `messaging_auto_register_recipients`. Auto-register is an
+                # ergonomic shortcut for genuinely new names — it must never
+                # be used to shadow-deliver to a real agent that lives
+                # elsewhere.
+                found_globally: set[str] = set()
+                globally_unlinked: dict[str, list[str]] = {}
+                async with get_session() as s_scan:
                     for missing in list(unknown_local):
-                        try:
-                            existing = await _find_agent_globally(missing)
-                            if existing:
-                                # Agent exists on another project. Only allow silent
-                                # resolution if an approved AgentLink connects
-                                # sender -> existing. Otherwise FAIL LOUD — do not
-                                # shadow-deliver to a recipient we have no link to.
-                                async with get_session() as s_link:
-                                    link_row = await s_link.execute(
-                                        select(AgentLink)
-                                        .where(  # type: ignore[arg-type]
-                                            cast(Any, AgentLink.a_project_id) == project.id,
-                                            cast(Any, AgentLink.a_agent_id) == sender.id,
-                                            cast(Any, AgentLink.b_project_id) == existing.project_id,
-                                            cast(Any, AgentLink.b_agent_id) == existing.id,
-                                            cast(Any, AgentLink.status == "approved"),
-                                        )
-                                        .limit(1)
-                                    )
-                                    approved_link = link_row.scalars().first()
-                                if approved_link is not None:
-                                    found_globally.add(missing)
-                                    await ctx.info(
-                                        f"[note] '{missing}' not in local project but found globally "
-                                        f"(project_id={existing.project_id}). Skipping local registration."
-                                    )
-                                    continue
-                                # Globally visible but unlinked — collect for fail-loud.
-                                # Look up the project's human_key for actionable data.
-                                async with get_session() as s_proj:
-                                    proj_row = await s_proj.execute(
-                                        select(Project).where(cast(Any, Project.id == existing.project_id))
-                                    )
-                                    ext_proj = proj_row.scalars().first()
-                                label = (
-                                    (ext_proj.human_key or ext_proj.slug)
-                                    if ext_proj is not None
-                                    else "unknown"
+                        # Collect ALL projects where this name lives (not just one).
+                        rows = await s_scan.execute(
+                            select(Agent, Project)
+                            .join(Project, cast(Any, Project.id == Agent.project_id))
+                            .where(cast(Any, func.lower(Agent.name) == missing.lower()))
+                            .order_by(Project.slug)
+                        )
+                        hits = list(rows.all())
+                        if not hits:
+                            continue  # truly unknown — handled below
+                        # Check for an approved AgentLink from sender to any hit.
+                        approved = False
+                        for agent_row, _proj in hits:
+                            link_row = await s_scan.execute(
+                                select(AgentLink)
+                                .where(  # type: ignore[arg-type]
+                                    cast(Any, AgentLink.a_project_id) == project.id,
+                                    cast(Any, AgentLink.a_agent_id) == sender.id,
+                                    cast(Any, AgentLink.b_project_id) == agent_row.project_id,
+                                    cast(Any, AgentLink.b_agent_id) == agent_row.id,
+                                    cast(Any, AgentLink.status == "approved"),
                                 )
-                                globally_unlinked.setdefault(missing, []).append(label)
-                                continue
-                            # Truly unknown agent — auto-register in sender's project
+                                .limit(1)
+                            )
+                            if link_row.scalars().first() is not None:
+                                approved = True
+                                break
+                        if approved:
+                            found_globally.add(missing)
+                            await ctx.info(
+                                f"[note] '{missing}' resolved via approved AgentLink. "
+                                "Skipping local registration."
+                            )
+                            continue
+                        # Globally visible but unlinked — fail-loud.
+                        # Use human_key when available, else fall back to slug (M2).
+                        labels = sorted({
+                            (proj.human_key or proj.slug)
+                            for _agent_row, proj in hits
+                        })
+                        globally_unlinked[missing] = labels
+
+                if globally_unlinked:
+                    unknown_payload = [
+                        {
+                            "name": name,
+                            "found_at_projects": projects,
+                            "hint": (
+                                "Use to_project=<project_key> to disambiguate, or "
+                                "call macro_contact_handshake to establish a contact link."
+                            ),
+                        }
+                        for name, projects in sorted(globally_unlinked.items())
+                    ]
+                    suggested = [
+                        {
+                            "tool": "macro_contact_handshake",
+                            "arguments": {
+                                # Fall back to slug when human_key is None (M2).
+                                "project_key": project.human_key or project.slug,
+                                "requester": sender.name,
+                                "target": name,
+                                "to_project": projects[0],
+                                "auto_accept": False,
+                            },
+                        }
+                        for name, projects in sorted(globally_unlinked.items())
+                    ]
+                    # Render per-recipient project list into the message so the
+                    # fail-loud is observable end-to-end (even through the MCP
+                    # client wrapper that strips structured data).
+                    rendered = "; ".join(
+                        f"{name} @ [{', '.join(projects)}]"
+                        for name, projects in sorted(globally_unlinked.items())
+                    )
+                    raise ToolExecutionError(
+                        "RECIPIENT_NOT_FOUND",
+                        (
+                            "Recipient(s) exist in other projects but no approved "
+                            f"contact link is in place: {rendered}. "
+                            "Use `to_project` or `macro_contact_handshake` to route correctly."
+                        ),
+                        recoverable=True,
+                        data={
+                            "unknown_recipients": unknown_payload,
+                            "suggested_tool_calls": suggested,
+                        },
+                    )
+
+                # Auto-register truly-unknown local recipients if enabled.
+                # At this point, any unknown_local names are either
+                # genuinely new (no global match) or resolved via AgentLink.
+                newly_registered: set[str] = set()
+                if getattr(settings_local, "messaging_auto_register_recipients", True):
+                    for missing in list(unknown_local):
+                        if missing in found_globally:
+                            continue
+                        try:
                             _ = await _get_or_create_agent(
                                 project,
                                 missing,
@@ -4317,64 +4373,27 @@ def build_mcp_server() -> FastMCP:
                             newly_registered.add(missing)
                         except Exception:
                             pass
-                    if globally_unlinked:
-                        unknown_payload = [
-                            {
-                                "name": name,
-                                "found_at_projects": projects,
-                                "hint": (
-                                    "Use to_project=<project_key> to disambiguate, or "
-                                    "call macro_contact_handshake to establish a contact link."
-                                ),
-                            }
-                            for name, projects in globally_unlinked.items()
-                        ]
-                        suggested = [
-                            {
-                                "tool": "macro_contact_handshake",
-                                "arguments": {
-                                    "project_key": project.human_key,
-                                    "requester": sender.name,
-                                    "target": name,
-                                    "to_project": projects[0],
-                                    "auto_accept": False,
-                                },
-                            }
-                            for name, projects in globally_unlinked.items()
-                        ]
-                        raise ToolExecutionError(
-                            "RECIPIENT_NOT_FOUND",
-                            (
-                                "Recipient(s) exist in other projects but no approved "
-                                "contact link is in place: "
-                                f"{', '.join(sorted(globally_unlinked))}. "
-                                "Use `to_project` or `macro_contact_handshake` to route correctly."
-                            ),
-                            recoverable=True,
-                            data={
-                                "unknown_recipients": unknown_payload,
-                                "suggested_tool_calls": suggested,
-                            },
-                        )
-                    unknown_local.difference_update(newly_registered)
-                    unknown_local.difference_update(found_globally)
-                    # Re-run routing for newly registered agents
-                    if newly_registered:
-                        from contextlib import suppress
-                        with suppress(_ContactBlocked):
-                            await _route(list(newly_registered), "to")
-                    # For globally-found agents, add directly to local_to —
-                    # _persist_message resolves via _get_agent_global.
-                    # Dedup against external to prevent double delivery (review C1).
-                    if found_globally:
-                        external_names = {
-                            nm.lower()
-                            for group in external.values()
-                            for nm in group.get("to", []) + group.get("cc", []) + group.get("bcc", [])
-                        } if external else set()
-                        for name in found_globally:
-                            if name.lower() not in external_names:
-                                local_to.append(name)
+                unknown_local.difference_update(newly_registered)
+                unknown_local.difference_update(found_globally)
+                # Re-run routing for newly registered agents
+                if newly_registered:
+                    from contextlib import suppress
+                    with suppress(_ContactBlocked):
+                        await _route(list(newly_registered), "to")
+                # For globally-found (AgentLink-approved) recipients, add
+                # directly to local_to — _persist_message resolves via
+                # _get_agent_global. Dedup against external to prevent
+                # double delivery (review C1). Runs regardless of
+                # auto-register config.
+                if found_globally:
+                    external_names = {
+                        nm.lower()
+                        for group in external.values()
+                        for nm in group.get("to", []) + group.get("cc", []) + group.get("bcc", [])
+                    } if external else set()
+                    for name in found_globally:
+                        if name.lower() not in external_names:
+                            local_to.append(name)
                 # Attempt cross-project handshakes for unknown external recipients if allowed
                 attempted_external: list[str] = []
                 try:
