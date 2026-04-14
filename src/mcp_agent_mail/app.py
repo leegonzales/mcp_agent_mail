@@ -3607,6 +3607,13 @@ def build_mcp_server() -> FastMCP:
         }}}
         ```
         """
+        if auto_contact_if_blocked:
+            logger.warning(
+                "auto_contact_if_blocked=True is deprecated and will be "
+                "removed in a future release. Use macro_contact_handshake() "
+                "up front to establish contact before sending. See "
+                "docs/deprecation-auto-contact-if-blocked.md"
+            )
         project = await _get_project_by_identifier(project_key)
 
         # Normalize 'to' parameter - accept single string and convert to list
