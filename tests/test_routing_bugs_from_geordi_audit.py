@@ -326,3 +326,110 @@ async def test_auto_contact_if_blocked_emits_deprecation_warning(isolated_env, c
         "no deprecation warning found. "
         f"records: {[r.getMessage() for r in caplog.records]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_recipient_not_found_lists_all_projects_where_name_exists(isolated_env):
+    """When a recipient name exists in MULTIPLE other projects without any
+    approved AgentLink, the RECIPIENT_NOT_FOUND payload must list ALL of
+    those projects (sorted) in `found_at_projects`, not just one."""
+    await ensure_schema()
+    async with get_session() as s:
+        p_sender = Project(slug="m-sender", human_key="M-Sender")
+        p_1 = Project(slug="m-one", human_key="M-One")
+        p_2 = Project(slug="m-two", human_key="M-Two")
+        p_3 = Project(slug="m-three", human_key="M-Three")
+        s.add_all([p_sender, p_1, p_2, p_3])
+        await s.commit()
+        await s.refresh(p_sender)
+        await s.refresh(p_1)
+        await s.refresh(p_2)
+        await s.refresh(p_3)
+        s.add_all([
+            Agent(project_id=p_sender.id, name="Alice",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_1.id, name="Dax",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_2.id, name="Dax",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_3.id, name="Dax",
+                  program="claude-code", model="opus", task_description=""),
+        ])
+        await s.commit()
+
+    server = build_mcp_server()
+    with pytest.raises(Exception) as excinfo:
+        async with Client(server) as client:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "m-sender",
+                    "sender_name": "Alice",
+                    "to": ["Dax"],
+                    "subject": "multi-project probe",
+                    "body_md": "test",
+                },
+            )
+
+    msg = str(excinfo.value)
+    # The fail-loud message must enumerate ALL three projects where Dax
+    # lives, not just one. Accept slug form.
+    joined = msg.lower()
+    assert "m-one" in joined, f"missing m-one in: {msg}"
+    assert "m-two" in joined, f"missing m-two in: {msg}"
+    assert "m-three" in joined, f"missing m-three in: {msg}"
+
+    # Additionally, call the in-process tool function directly via its
+    # registered FunctionTool.fn to inspect the structured
+    # ToolExecutionError.data payload.
+    from mcp_agent_mail.app import ToolExecutionError
+    from fastmcp.tools.tool import FunctionTool  # type: ignore
+
+    async def _invoke_direct() -> None:
+        # Find the wrapped send_message function from the registered tool
+        # manager so we bypass the MCP client serialization.
+        server_inner = build_mcp_server()
+        tools = server_inner._tool_manager._tools  # type: ignore[attr-defined]
+        assert "send_message" in tools
+        ftool = tools["send_message"]
+        assert isinstance(ftool, FunctionTool)
+        raw_fn = ftool.fn
+        # Build a minimal stub Context that satisfies info/error/debug coroutines.
+        class _Ctx:
+            async def info(self, *a, **kw): pass
+            async def error(self, *a, **kw): pass
+            async def debug(self, *a, **kw): pass
+            async def warning(self, *a, **kw): pass
+            metadata: dict = {}
+
+        await raw_fn(
+            ctx=_Ctx(),
+            project_key="m-sender",
+            sender_name="Alice",
+            to=["Dax"],
+            subject="multi-project probe",
+            body_md="test",
+        )
+
+    with pytest.raises(ToolExecutionError) as tee_info:
+        await _invoke_direct()
+    tee = tee_info.value
+    assert tee.error_type == "RECIPIENT_NOT_FOUND"
+    unknown = tee.data["unknown_recipients"]
+    dax_entry = next((u for u in unknown if u["name"] == "Dax"), None)
+    assert dax_entry is not None, f"no Dax entry: {unknown}"
+    found = dax_entry["found_at_projects"]
+    joined_list = " ".join(found).lower()
+    assert "m-one" in joined_list, found
+    assert "m-two" in joined_list, found
+    assert "m-three" in joined_list, found
+    assert len(found) == 3, f"expected 3 projects, got {len(found)}: {found}"
+    assert found == sorted(found), f"found_at_projects not sorted: {found}"
+    # And the suggested_tool_calls entry for Dax uses the first (sorted)
+    # project as to_project — deterministic.
+    suggested = tee.data["suggested_tool_calls"]
+    dax_sugg = next(
+        (s for s in suggested if s["arguments"].get("target") == "Dax"), None
+    )
+    assert dax_sugg is not None, suggested
+    assert dax_sugg["arguments"]["to_project"] == found[0]
