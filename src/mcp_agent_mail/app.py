@@ -4262,49 +4262,65 @@ def build_mcp_server() -> FastMCP:
                 # elsewhere.
                 found_globally: set[str] = set()
                 globally_unlinked: dict[str, list[str]] = {}
-                async with get_session() as s_scan:
-                    for missing in list(unknown_local):
-                        # Collect ALL projects where this name lives (not just one).
+                if unknown_local:
+                    lowered_to_original: dict[str, str] = {
+                        name.lower(): name for name in unknown_local
+                    }
+                    lowered_names = list(lowered_to_original.keys())
+                    # Bucket: lowered_name -> list[(Agent, Project)] for all
+                    # hits across the fleet. Built from a SINGLE query.
+                    hits_by_name: dict[str, list[tuple[Agent, Project]]] = {}
+                    # Flat list of matched agent ids, used for a SINGLE bulk
+                    # AgentLink query below.
+                    hit_agent_ids: list[int] = []
+                    async with get_session() as s_scan:
+                        # (1) Single bulk lookup for ALL unknown_local names.
                         rows = await s_scan.execute(
                             select(Agent, Project)
                             .join(Project, cast(Any, Project.id == Agent.project_id))
-                            .where(cast(Any, func.lower(Agent.name) == missing.lower()))
+                            .where(cast(Any, func.lower(Agent.name).in_(lowered_names)))
                             .order_by(Project.slug)
                         )
-                        hits = list(rows.all())
-                        if not hits:
-                            continue  # truly unknown — handled below
-                        # Check for an approved AgentLink from sender to any hit.
-                        approved = False
-                        for agent_row, _proj in hits:
-                            link_row = await s_scan.execute(
-                                select(AgentLink)
+                        for agent_row, proj_row in rows.all():
+                            key = agent_row.name.lower()
+                            hits_by_name.setdefault(key, []).append((agent_row, proj_row))
+                            if agent_row.id is not None:
+                                hit_agent_ids.append(agent_row.id)
+
+                        # (2) Single bulk AgentLink query for every candidate
+                        # target agent — approved links from this sender only.
+                        approved_target_ids: set[int] = set()
+                        if hit_agent_ids:
+                            link_rows = await s_scan.execute(
+                                select(AgentLink.b_agent_id)
                                 .where(  # type: ignore[arg-type]
                                     cast(Any, AgentLink.a_project_id) == project.id,
                                     cast(Any, AgentLink.a_agent_id) == sender.id,
-                                    cast(Any, AgentLink.b_project_id) == agent_row.project_id,
-                                    cast(Any, AgentLink.b_agent_id) == agent_row.id,
                                     cast(Any, AgentLink.status == "approved"),
+                                    cast(Any, AgentLink.b_agent_id.in_(hit_agent_ids)),
                                 )
-                                .limit(1)
                             )
-                            if link_row.scalars().first() is not None:
-                                approved = True
-                                break
+                            approved_target_ids = {
+                                bid for (bid,) in link_rows.all() if bid is not None
+                            }
+
+                    # (3) In-memory classification — zero queries.
+                    for lower_name, hits in hits_by_name.items():
+                        original = lowered_to_original.get(lower_name, lower_name)
+                        approved = any(a.id in approved_target_ids for a, _p in hits)
                         if approved:
-                            found_globally.add(missing)
+                            found_globally.add(original)
                             await ctx.info(
-                                f"[note] '{missing}' resolved via approved AgentLink. "
+                                f"[note] '{original}' resolved via approved AgentLink. "
                                 "Skipping local registration."
                             )
                             continue
                         # Globally visible but unlinked — fail-loud.
                         # Use human_key when available, else fall back to slug (M2).
                         labels = sorted({
-                            (proj.human_key or proj.slug)
-                            for _agent_row, proj in hits
+                            (proj.human_key or proj.slug) for _a, proj in hits
                         })
-                        globally_unlinked[missing] = labels
+                        globally_unlinked[original] = labels
 
                 if globally_unlinked:
                     unknown_payload = [
