@@ -276,3 +276,53 @@ async def test_send_message_to_project_param_routes_cross_project(isolated_env):
             f"to_project='servitor' leaked a geordi-local shadow delivery. "
             f"Delivered to: {delivery_projects}"
         )
+
+
+@pytest.mark.asyncio
+async def test_auto_contact_if_blocked_emits_deprecation_warning(isolated_env, caplog):
+    """auto_contact_if_blocked=True must log a deprecation warning so callers
+    migrate to macro_contact_handshake up front."""
+    import logging
+
+    await ensure_schema()
+    async with get_session() as s:
+        p = Project(slug="fake-dep", human_key="Fake-Dep")
+        s.add(p)
+        await s.commit()
+        await s.refresh(p)
+        a = Agent(project_id=p.id, name="Alice",
+                  program="claude-code", model="opus", task_description="")
+        s.add(a)
+        await s.commit()
+
+    caplog.set_level(logging.WARNING, logger="mcp_agent_mail.app")
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        # Send to a non-existent recipient with auto_contact_if_blocked=True.
+        # Will likely fail for other reasons; we only care that the
+        # deprecation warning fires.
+        try:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "fake-dep",
+                    "sender_name": "Alice",
+                    "to": ["Ghost"],
+                    "subject": "smoke",
+                    "body_md": "test",
+                    "auto_contact_if_blocked": True,
+                },
+            )
+        except Exception:
+            pass  # we don't care about the send result, only the warning
+
+    matches = [
+        r for r in caplog.records
+        if "auto_contact_if_blocked" in r.getMessage()
+        and "deprecated" in r.getMessage().lower()
+    ]
+    assert matches, (
+        "no deprecation warning found. "
+        f"records: {[r.getMessage() for r in caplog.records]}"
+    )
