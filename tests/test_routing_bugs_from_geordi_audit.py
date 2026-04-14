@@ -160,6 +160,59 @@ async def test_macro_contact_handshake_welcome_sends_cross_project(isolated_env)
 
 
 @pytest.mark.asyncio
+async def test_send_to_globally_visible_without_link_fails_loud(isolated_env):
+    """When a recipient name exists in another project but no approved AgentLink
+    connects sender->recipient, send_message must raise RECIPIENT_NOT_FOUND with
+    actionable data, NOT silently shadow-create a local copy."""
+    from sqlalchemy import select as _select
+
+    await ensure_schema()
+
+    # Seed two projects + one agent in each. NO AgentLink between them.
+    async with get_session() as s:
+        p_sender = Project(slug="fake-sender", human_key="Fake-Sender")
+        p_recipient = Project(slug="fake-recipient", human_key="Fake-Recipient")
+        s.add_all([p_sender, p_recipient])
+        await s.commit()
+        await s.refresh(p_sender)
+        await s.refresh(p_recipient)
+        a_sender = Agent(project_id=p_sender.id, name="Alice",
+                         program="claude-code", model="opus", task_description="")
+        a_recipient = Agent(project_id=p_recipient.id, name="Bob",
+                            program="claude-code", model="opus", task_description="")
+        s.add_all([a_sender, a_recipient])
+        await s.commit()
+
+    server = build_mcp_server()
+    with pytest.raises(Exception) as excinfo:
+        async with Client(server) as client:
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "fake-sender",
+                    "sender_name": "Alice",
+                    "to": ["Bob"],  # Bob exists globally at fake-recipient, no AgentLink
+                    "subject": "smoke",
+                    "body_md": "test",
+                },
+            )
+
+    msg = str(excinfo.value)
+    assert "RECIPIENT_NOT_FOUND" in msg, f"expected RECIPIENT_NOT_FOUND, got: {msg}"
+    assert "Bob" in msg, f"expected Bob in error message, got: {msg}"
+
+    # Must NOT have silently created a shadow Bob in sender's project.
+    async with get_session() as s:
+        q = (
+            _select(Agent)
+            .join(Project, Project.id == Agent.project_id)
+            .where(Project.slug == "fake-sender", Agent.name == "Bob")
+        )
+        shadow = (await s.execute(q)).scalar_one_or_none()
+        assert shadow is None, "shadow agent was silently created - BUG STILL PRESENT"
+
+
+@pytest.mark.asyncio
 async def test_send_message_to_project_whitespace_only_rejected(isolated_env):
     """Bug 3 edge case (Codex review): whitespace-only `to_project` must
     fail loud, not silently no-op. Silent no-op would route to sender's
