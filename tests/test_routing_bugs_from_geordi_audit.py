@@ -330,9 +330,18 @@ async def test_auto_contact_if_blocked_emits_deprecation_warning(isolated_env, c
 
 @pytest.mark.asyncio
 async def test_recipient_not_found_lists_all_projects_where_name_exists(isolated_env):
-    """When a recipient name exists in MULTIPLE other projects without any
-    approved AgentLink, the RECIPIENT_NOT_FOUND payload must list ALL of
-    those projects (sorted) in `found_at_projects`, not just one."""
+    """When a recipient name exists in MULTIPLE other projects AND the
+    sender has approved AgentLinks into all of them (i.e. they're
+    sender-visible), the RECIPIENT_NOT_FOUND payload must list ALL of
+    those projects (sorted) in `found_at_projects`, not just one.
+
+    The visibility filter (Gemini round-3 #2) means we have to seed
+    sender-visible projects via Anchor links (an unrelated agent in
+    each project) — without those, the visibility scope rule would
+    return an empty list. The visibility rule itself is asserted by
+    test_recipient_not_found_payload_does_not_leak_unlinked_projects
+    and test_recipient_not_found_payload_lists_only_visible_projects.
+    """
     await ensure_schema()
     async with get_session() as s:
         p_sender = Project(slug="m-sender", human_key="M-Sender")
@@ -345,15 +354,43 @@ async def test_recipient_not_found_lists_all_projects_where_name_exists(isolated
         await s.refresh(p_1)
         await s.refresh(p_2)
         await s.refresh(p_3)
+        a_alice = Agent(project_id=p_sender.id, name="Alice",
+                        program="claude-code", model="opus", task_description="")
+        # Anchor agents establish sender-visibility into each project
+        # without giving Alice an approved link to Dax itself.
+        a_anchor_1 = Agent(project_id=p_1.id, name="Anchor1",
+                           program="claude-code", model="opus", task_description="")
+        a_anchor_2 = Agent(project_id=p_2.id, name="Anchor2",
+                           program="claude-code", model="opus", task_description="")
+        a_anchor_3 = Agent(project_id=p_3.id, name="Anchor3",
+                           program="claude-code", model="opus", task_description="")
         s.add_all([
-            Agent(project_id=p_sender.id, name="Alice",
-                  program="claude-code", model="opus", task_description=""),
+            a_alice, a_anchor_1, a_anchor_2, a_anchor_3,
             Agent(project_id=p_1.id, name="Dax",
                   program="claude-code", model="opus", task_description=""),
             Agent(project_id=p_2.id, name="Dax",
                   program="claude-code", model="opus", task_description=""),
             Agent(project_id=p_3.id, name="Dax",
                   program="claude-code", model="opus", task_description=""),
+        ])
+        await s.commit()
+        await s.refresh(a_alice)
+        await s.refresh(a_anchor_1)
+        await s.refresh(a_anchor_2)
+        await s.refresh(a_anchor_3)
+        # Approved AgentLinks from Alice to each anchor — this gives
+        # Alice "visibility" into m-one, m-two, m-three for the
+        # purposes of the RECIPIENT_NOT_FOUND payload scope.
+        s.add_all([
+            AgentLink(a_project_id=p_sender.id, a_agent_id=a_alice.id,
+                      b_project_id=p_1.id, b_agent_id=a_anchor_1.id,
+                      status="approved"),
+            AgentLink(a_project_id=p_sender.id, a_agent_id=a_alice.id,
+                      b_project_id=p_2.id, b_agent_id=a_anchor_2.id,
+                      status="approved"),
+            AgentLink(a_project_id=p_sender.id, a_agent_id=a_alice.id,
+                      b_project_id=p_3.id, b_agent_id=a_anchor_3.id,
+                      status="approved"),
         ])
         await s.commit()
 

@@ -4298,6 +4298,12 @@ def build_mcp_server() -> FastMCP:
                     # Flat list of matched agent ids, used for a SINGLE bulk
                     # AgentLink query below.
                     hit_agent_ids: list[int] = []
+                    # Sender-visible projects: every project the sender has
+                    # at least one approved AgentLink into. Used to scope the
+                    # RECIPIENT_NOT_FOUND `found_at_projects` payload so we
+                    # don't enumerate unrelated projects across tenants
+                    # (Gemini round-3 #2 [security]).
+                    sender_visible_project_ids: set[int] = set()
                     async with get_session() as s_scan:
                         # (1) Single bulk lookup for ALL unknown_local names.
                         # Exclude the sender's own project — local agents are
@@ -4335,6 +4341,21 @@ def build_mcp_server() -> FastMCP:
                                 bid for (bid,) in link_rows.all() if bid is not None
                             }
 
+                        # (3) Sender's full visibility set — every project
+                        # they have any approved AgentLink into. ONE query.
+                        vis_rows = await s_scan.execute(
+                            select(AgentLink.b_project_id)
+                            .where(  # type: ignore[arg-type]
+                                cast(Any, AgentLink.a_project_id) == project.id,
+                                cast(Any, AgentLink.a_agent_id) == sender.id,
+                                cast(Any, AgentLink.status == "approved"),
+                            )
+                            .distinct()
+                        )
+                        sender_visible_project_ids = {
+                            pid for (pid,) in vis_rows.all() if pid is not None
+                        }
+
                     # (3) In-memory classification — zero queries.
                     for lower_name, hits in hits_by_name.items():
                         original = lowered_to_original.get(lower_name, lower_name)
@@ -4347,24 +4368,46 @@ def build_mcp_server() -> FastMCP:
                             )
                             continue
                         # Globally visible but unlinked — fail-loud.
-                        # Use human_key when available, else fall back to slug (M2).
+                        # SECURITY (Gemini round-3 #2): only enumerate
+                        # projects the sender already has approved AgentLinks
+                        # into. If they have none, return an empty list and
+                        # let the hint text guide them to use `to_project`
+                        # or run an explicit handshake. Use human_key when
+                        # available, else fall back to slug (M2).
+                        visible_hits = [
+                            (a, proj) for a, proj in hits
+                            if proj.id in sender_visible_project_ids
+                        ]
                         labels = sorted({
-                            (proj.human_key or proj.slug) for _a, proj in hits
+                            (proj.human_key or proj.slug) for _a, proj in visible_hits
                         })
                         globally_unlinked[original] = labels
 
                 if globally_unlinked:
+                    def _hint_for(projs: list[str]) -> str:
+                        if projs:
+                            return (
+                                "Use to_project=<project_key> to disambiguate, or "
+                                "call macro_contact_handshake to establish a contact link."
+                            )
+                        return (
+                            "An agent with this name exists in one or more "
+                            "other projects you don't have visibility into. "
+                            "Use `to_project` if you know the target project, "
+                            "or ask an operator to set up an explicit handshake."
+                        )
+
                     unknown_payload = [
                         {
                             "name": name,
                             "found_at_projects": projects,
-                            "hint": (
-                                "Use to_project=<project_key> to disambiguate, or "
-                                "call macro_contact_handshake to establish a contact link."
-                            ),
+                            "hint": _hint_for(projects),
                         }
                         for name, projects in sorted(globally_unlinked.items())
                     ]
+                    # Only suggest handshake calls when we have a target
+                    # project to point at — otherwise we'd leak project ids
+                    # via the suggestion payload (Gemini round-3 #2).
                     suggested = [
                         {
                             "tool": "macro_contact_handshake",
@@ -4378,12 +4421,19 @@ def build_mcp_server() -> FastMCP:
                             },
                         }
                         for name, projects in sorted(globally_unlinked.items())
+                        if projects
                     ]
                     # Render per-recipient project list into the message so the
                     # fail-loud is observable end-to-end (even through the MCP
-                    # client wrapper that strips structured data).
+                    # client wrapper that strips structured data). When the
+                    # visible-projects list is empty (sender has no AgentLinks
+                    # to any project where the name lives), show "no visible
+                    # project" so the failure mode is still legible without
+                    # leaking unrelated slugs.
+                    def _render_projects(projs: list[str]) -> str:
+                        return f"[{', '.join(projs)}]" if projs else "[no visible project]"
                     rendered = "; ".join(
-                        f"{name} @ [{', '.join(projects)}]"
+                        f"{name} @ {_render_projects(projects)}"
                         for name, projects in sorted(globally_unlinked.items())
                     )
                     raise ToolExecutionError(
