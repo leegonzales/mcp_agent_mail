@@ -495,3 +495,268 @@ def _capture_logs(logger):
     finally:
         logger.removeHandler(h)
         logger.setLevel(prior_level)
+
+
+# =============================================================================
+# Gemini round 3 regressions — fixes #1, #2, #3, #5
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_globally_unlinked_scan_excludes_current_project(isolated_env):
+    """Gemini #1: the hoisted invariant scan must NOT include agents from
+    the sender's own project. Otherwise a name that exists locally (but
+    misses the local_lookup cache for any reason) gets flagged as
+    `globally_unlinked` and triggers RECIPIENT_NOT_FOUND, breaking
+    legitimate local delivery.
+
+    Repro: seed Alice (sender) and an agent named "Lima" in the SAME
+    project. Force a path where "Lima" reaches `unknown_local` despite
+    being a local agent — easiest via a stale local_lookup cache after a
+    direct DB seed that bypasses the canonical naming pipeline. The
+    bulk SELECT must exclude project.id == sender.project_id.
+    """
+    from sqlalchemy import select as _select
+
+    await ensure_schema()
+    async with get_session() as s:
+        p_local = Project(slug="r3-local", human_key="R3-Local")
+        s.add(p_local)
+        await s.commit()
+        await s.refresh(p_local)
+        s.add_all([
+            Agent(project_id=p_local.id, name="Alice",
+                  program="claude-code", model="opus", task_description=""),
+            # Note: directly seeding "Lima" with a name that the
+            # local_lookup pipeline canonicalizes the same way. We rely
+            # on the auto-register flow to hit the bug instead.
+        ])
+        await s.commit()
+
+    # The reliable trigger: send to a new name "Lima". After the hoisted
+    # scan finds NO global match, auto-register creates Lima in the
+    # current project. The recursive _route should not re-trigger
+    # RECIPIENT_NOT_FOUND against the just-created local row. Net:
+    # send must succeed, Lima must be delivered.
+    server = build_mcp_server()
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "r3-local",
+                "sender_name": "Alice",
+                "to": ["Lima"],
+                "subject": "auto-register smoke",
+                "body_md": "should deliver locally",
+            },
+        )
+
+    deliveries = result.data.get("deliveries") or []
+    assert deliveries, f"expected at least one delivery, got: {result.data}"
+    delivery_to = []
+    for d in deliveries:
+        delivery_to.extend(d.get("payload", {}).get("to", []))
+    assert "Lima" in delivery_to, (
+        f"Lima not delivered. recipients across deliveries: {delivery_to}"
+    )
+
+    # Lima should now be a local agent — and exist EXACTLY once locally
+    # (no shadow).
+    async with get_session() as s:
+        rows = await s.execute(
+            _select(Agent).join(Project, Project.id == Agent.project_id)
+            .where(Project.slug == "r3-local", Agent.name == "Lima")
+        )
+        local_lima = rows.scalars().all()
+        assert len(local_lima) == 1, f"expected exactly 1 local Lima, got {len(local_lima)}"
+
+
+@pytest.mark.asyncio
+async def test_recipient_not_found_payload_does_not_leak_unlinked_projects(isolated_env):
+    """Gemini #2 [security]: the RECIPIENT_NOT_FOUND payload must not
+    enumerate every project where a name happens to exist. Sender should
+    only see projects they already have approved AgentLinks to. If they
+    have no link to any of them, `found_at_projects` is empty and the
+    hint advises an explicit handshake or `to_project`."""
+    from mcp_agent_mail.app import ToolExecutionError
+    from fastmcp.tools.tool import FunctionTool  # type: ignore
+
+    await ensure_schema()
+    async with get_session() as s:
+        p_sender = Project(slug="r3-leak-sender", human_key="R3-Leak-Sender")
+        p_secret_a = Project(slug="r3-secret-a", human_key="R3-Secret-A")
+        p_secret_b = Project(slug="r3-secret-b", human_key="R3-Secret-B")
+        s.add_all([p_sender, p_secret_a, p_secret_b])
+        await s.commit()
+        await s.refresh(p_sender)
+        await s.refresh(p_secret_a)
+        await s.refresh(p_secret_b)
+        s.add_all([
+            Agent(project_id=p_sender.id, name="Alice",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_secret_a.id, name="Mike",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_secret_b.id, name="Mike",
+                  program="claude-code", model="opus", task_description=""),
+        ])
+        await s.commit()
+
+    server = build_mcp_server()
+    tools = server._tool_manager._tools  # type: ignore[attr-defined]
+    ftool = tools["send_message"]
+    assert isinstance(ftool, FunctionTool)
+    raw_fn = ftool.fn
+
+    class _Ctx:
+        async def info(self, *a, **kw): pass
+        async def error(self, *a, **kw): pass
+        async def debug(self, *a, **kw): pass
+        async def warning(self, *a, **kw): pass
+        metadata: dict = {}
+
+    with pytest.raises(ToolExecutionError) as tee_info:
+        await raw_fn(
+            ctx=_Ctx(),
+            project_key="r3-leak-sender",
+            sender_name="Alice",
+            to=["Mike"],
+            subject="leak probe",
+            body_md="",
+        )
+    tee = tee_info.value
+    assert tee.error_type == "RECIPIENT_NOT_FOUND"
+    unknown = tee.data["unknown_recipients"]
+    mike_entry = next((u for u in unknown if u["name"] == "Mike"), None)
+    assert mike_entry is not None, unknown
+    # Sender has no AgentLink to either secret project — so it must not
+    # learn of their existence via this payload.
+    assert mike_entry["found_at_projects"] == [], (
+        f"info leak: sender saw projects it has no AgentLink to: "
+        f"{mike_entry['found_at_projects']}"
+    )
+    # The error message must not enumerate the secret project labels.
+    msg = str(tee).lower()
+    assert "r3-secret-a" not in msg, f"leaked project slug in message: {msg}"
+    assert "r3-secret-b" not in msg, f"leaked project slug in message: {msg}"
+
+
+@pytest.mark.asyncio
+async def test_recipient_not_found_payload_lists_only_visible_projects(isolated_env):
+    """Companion to the leak test: when the sender HAS approved AgentLinks
+    to one of the projects (but not all), only the visible projects are
+    listed."""
+    from mcp_agent_mail.app import ToolExecutionError
+    from fastmcp.tools.tool import FunctionTool  # type: ignore
+
+    await ensure_schema()
+    async with get_session() as s:
+        p_sender = Project(slug="r3-vis-sender", human_key="R3-Vis-Sender")
+        p_seen = Project(slug="r3-vis-seen", human_key="R3-Vis-Seen")
+        p_hidden = Project(slug="r3-vis-hidden", human_key="R3-Vis-Hidden")
+        s.add_all([p_sender, p_seen, p_hidden])
+        await s.commit()
+        await s.refresh(p_sender)
+        await s.refresh(p_seen)
+        await s.refresh(p_hidden)
+        a_alice = Agent(project_id=p_sender.id, name="Alice",
+                        program="claude-code", model="opus", task_description="")
+        a_seen_anchor = Agent(project_id=p_seen.id, name="Anchor",
+                              program="claude-code", model="opus", task_description="")
+        a_seen_oscar = Agent(project_id=p_seen.id, name="Oscar",
+                             program="claude-code", model="opus", task_description="")
+        a_hidden_oscar = Agent(project_id=p_hidden.id, name="Oscar",
+                               program="claude-code", model="opus", task_description="")
+        s.add_all([a_alice, a_seen_anchor, a_seen_oscar, a_hidden_oscar])
+        await s.commit()
+        await s.refresh(a_alice)
+        await s.refresh(a_seen_anchor)
+        # Alice has an approved AgentLink to Anchor in p_seen — but NOT
+        # an Oscar link. The visibility rule should still surface
+        # p_seen because Alice is "linked into" it.
+        s.add(AgentLink(
+            a_project_id=p_sender.id, a_agent_id=a_alice.id,
+            b_project_id=p_seen.id, b_agent_id=a_seen_anchor.id,
+            status="approved",
+        ))
+        await s.commit()
+
+    server = build_mcp_server()
+    tools = server._tool_manager._tools  # type: ignore[attr-defined]
+    ftool = tools["send_message"]
+    assert isinstance(ftool, FunctionTool)
+    raw_fn = ftool.fn
+
+    class _Ctx:
+        async def info(self, *a, **kw): pass
+        async def error(self, *a, **kw): pass
+        async def debug(self, *a, **kw): pass
+        async def warning(self, *a, **kw): pass
+        metadata: dict = {}
+
+    with pytest.raises(ToolExecutionError) as tee_info:
+        await raw_fn(
+            ctx=_Ctx(),
+            project_key="r3-vis-sender",
+            sender_name="Alice",
+            to=["Oscar"],
+            subject="visibility probe",
+            body_md="",
+        )
+    tee = tee_info.value
+    unknown = tee.data["unknown_recipients"]
+    oscar_entry = next((u for u in unknown if u["name"] == "Oscar"), None)
+    assert oscar_entry is not None, unknown
+    found = oscar_entry["found_at_projects"]
+    # p_seen is sender-visible; p_hidden is not.
+    joined = " ".join(found).lower()
+    assert "r3-vis-seen" in joined, found
+    assert "r3-vis-hidden" not in joined, (
+        f"hidden project leaked into visible-projects list: {found}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cc_and_bcc_kinds_preserved_through_resolution(isolated_env):
+    """Gemini #5: globally-found (AgentLink-approved) recipients must
+    land in the kind they were originally specified in (`to`/`cc`/`bcc`),
+    not all promoted to primary `to`. Auto-registered new local
+    recipients also must respect their original kind."""
+    await _seed_cross_project_link(
+        "geordi", "Geordi-Home", "Geordi",
+        "servitor", "Servitor", "Adama",
+    )
+    server = build_mcp_server()
+    async with Client(server) as client:
+        # CC: Adama is bare-name CC'd. Should resolve via approved
+        # AgentLink to Adama@servitor and land in CC, not TO.
+        result = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "geordi",
+                "sender_name": "Geordi",
+                "to": ["Geordi"],  # self primary
+                "cc": ["Adama@servitor"],  # explicit external CC
+                "subject": "kind preservation probe",
+                "body_md": "",
+            },
+        )
+        deliveries = result.data.get("deliveries") or []
+        assert deliveries, "no deliveries"
+        # Find the Servitor-side delivery
+        servitor_delivery = next(
+            (d for d in deliveries if d.get("project") in ("Servitor", "servitor")),
+            None,
+        )
+        assert servitor_delivery is not None, (
+            f"no Servitor delivery: {deliveries}"
+        )
+        payload = servitor_delivery["payload"]
+        # Adama must be in cc, not to
+        assert "Adama" in payload.get("cc", []), (
+            f"Adama lost CC kind. payload cc={payload.get('cc')}, "
+            f"to={payload.get('to')}, bcc={payload.get('bcc')}"
+        )
+        assert "Adama" not in payload.get("to", []), (
+            f"Adama promoted to TO from CC. payload to={payload.get('to')}"
+        )
+        logger.setLevel(prior_level)
