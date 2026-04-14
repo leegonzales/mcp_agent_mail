@@ -4190,16 +4190,49 @@ def build_mcp_server() -> FastMCP:
                     # _get_agent_global will resolve correctly at delivery time.
                     newly_registered: set[str] = set()
                     found_globally: set[str] = set()
+                    # Map name -> [project_keys] for globally-visible unlinked recipients.
+                    globally_unlinked: dict[str, list[str]] = {}
                     for missing in list(unknown_local):
                         try:
                             existing = await _find_agent_globally(missing)
                             if existing:
-                                # Agent exists on another project — no ghost needed
-                                found_globally.add(missing)
-                                await ctx.info(
-                                    f"[note] '{missing}' not in local project but found globally "
-                                    f"(project_id={existing.project_id}). Skipping local registration."
+                                # Agent exists on another project. Only allow silent
+                                # resolution if an approved AgentLink connects
+                                # sender -> existing. Otherwise FAIL LOUD — do not
+                                # shadow-deliver to a recipient we have no link to.
+                                async with get_session() as s_link:
+                                    link_row = await s_link.execute(
+                                        select(AgentLink)
+                                        .where(  # type: ignore[arg-type]
+                                            cast(Any, AgentLink.a_project_id) == project.id,
+                                            cast(Any, AgentLink.a_agent_id) == sender.id,
+                                            cast(Any, AgentLink.b_project_id) == existing.project_id,
+                                            cast(Any, AgentLink.b_agent_id) == existing.id,
+                                            cast(Any, AgentLink.status == "approved"),
+                                        )
+                                        .limit(1)
+                                    )
+                                    approved_link = link_row.scalars().first()
+                                if approved_link is not None:
+                                    found_globally.add(missing)
+                                    await ctx.info(
+                                        f"[note] '{missing}' not in local project but found globally "
+                                        f"(project_id={existing.project_id}). Skipping local registration."
+                                    )
+                                    continue
+                                # Globally visible but unlinked — collect for fail-loud.
+                                # Look up the project's human_key for actionable data.
+                                async with get_session() as s_proj:
+                                    proj_row = await s_proj.execute(
+                                        select(Project).where(cast(Any, Project.id == existing.project_id))
+                                    )
+                                    ext_proj = proj_row.scalars().first()
+                                label = (
+                                    (ext_proj.human_key or ext_proj.slug)
+                                    if ext_proj is not None
+                                    else "unknown"
                                 )
+                                globally_unlinked.setdefault(missing, []).append(label)
                                 continue
                             # Truly unknown agent — auto-register in sender's project
                             _ = await _get_or_create_agent(
@@ -4213,6 +4246,45 @@ def build_mcp_server() -> FastMCP:
                             newly_registered.add(missing)
                         except Exception:
                             pass
+                    if globally_unlinked:
+                        unknown_payload = [
+                            {
+                                "name": name,
+                                "found_at_projects": projects,
+                                "hint": (
+                                    "Use to_project=<project_key> to disambiguate, or "
+                                    "call macro_contact_handshake to establish a contact link."
+                                ),
+                            }
+                            for name, projects in globally_unlinked.items()
+                        ]
+                        suggested = [
+                            {
+                                "tool": "macro_contact_handshake",
+                                "arguments": {
+                                    "project_key": project.human_key,
+                                    "requester": sender.name,
+                                    "target": name,
+                                    "to_project": projects[0],
+                                    "auto_accept": False,
+                                },
+                            }
+                            for name, projects in globally_unlinked.items()
+                        ]
+                        raise ToolExecutionError(
+                            "RECIPIENT_NOT_FOUND",
+                            (
+                                "Recipient(s) exist in other projects but no approved "
+                                "contact link is in place: "
+                                f"{', '.join(sorted(globally_unlinked))}. "
+                                "Use `to_project` or `macro_contact_handshake` to route correctly."
+                            ),
+                            recoverable=True,
+                            data={
+                                "unknown_recipients": unknown_payload,
+                                "suggested_tool_calls": suggested,
+                            },
+                        )
                     unknown_local.difference_update(newly_registered)
                     unknown_local.difference_update(found_globally)
                     # Re-run routing for newly registered agents

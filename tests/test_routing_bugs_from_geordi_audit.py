@@ -198,8 +198,12 @@ async def test_send_to_globally_visible_without_link_fails_loud(isolated_env):
             )
 
     msg = str(excinfo.value)
-    assert "RECIPIENT_NOT_FOUND" in msg, f"expected RECIPIENT_NOT_FOUND, got: {msg}"
+    # The fastmcp wrapper strips the ToolExecutionError type prefix, so check
+    # for the distinctive fail-loud message content that only the
+    # RECIPIENT_NOT_FOUND path emits.
     assert "Bob" in msg, f"expected Bob in error message, got: {msg}"
+    assert "no approved contact link" in msg, f"expected fail-loud message, got: {msg}"
+    assert "macro_contact_handshake" in msg, f"expected handshake suggestion, got: {msg}"
 
     # Must NOT have silently created a shadow Bob in sender's project.
     async with get_session() as s:
