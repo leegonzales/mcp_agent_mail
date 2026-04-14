@@ -3400,6 +3400,70 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
 
+    @mcp.tool(name="list_agents")
+    @_instrument_tool("list_agents", cluster=CLUSTER_IDENTITY, capabilities={"identity", "audit"}, project_arg="project_key")
+    async def list_agents(
+        ctx: Context,
+        project_key: str,
+    ) -> dict[str, Any]:
+        """
+        Diagnostic: list agents registered to a project plus shadow candidates.
+
+        Shadow candidates are local agents whose name ALSO exists in at least
+        one other project — a likely fingerprint of the historical silent
+        shadow-create path. Read-only.
+
+        Parameters
+        ----------
+        project_key : str
+            Project slug or human key.
+
+        Returns
+        -------
+        dict
+            {
+              "project_key": str,
+              "local": [{name, id, project_slug}],
+              "shadow_candidates": [{name, also_at: [project_slug, ...]}]
+            }
+        """
+        project = await _get_project_by_identifier(project_key)
+        async with get_session() as session:
+            local_rows = await session.execute(
+                select(Agent)
+                .where(cast(Any, Agent.project_id == project.id))
+                .order_by(Agent.name)
+            )
+            local_agents = list(local_rows.scalars().all())
+
+            shadow_candidates: list[dict[str, Any]] = []
+            for a in local_agents:
+                other_rows = await session.execute(
+                    select(Project.slug, Project.human_key)
+                    .join(Agent, cast(Any, Agent.project_id == Project.id))
+                    .where(
+                        cast(Any, func.lower(Agent.name) == a.name.lower()),
+                        cast(Any, Project.id != project.id),
+                    )
+                    .order_by(Project.slug)
+                )
+                also_at = [slug for (slug, _hk) in other_rows.all()]
+                if also_at:
+                    shadow_candidates.append({"name": a.name, "also_at": also_at})
+
+        await ctx.info(
+            f"list_agents '{project.human_key}' -> {len(local_agents)} local, "
+            f"{len(shadow_candidates)} shadow candidates"
+        )
+        return {
+            "project_key": project.human_key or project.slug,
+            "local": [
+                {"name": a.name, "id": a.id, "project_slug": project.slug}
+                for a in local_agents
+            ],
+            "shadow_candidates": shadow_candidates,
+        }
+
     @mcp.tool(name="create_agent_identity")
     @_instrument_tool("create_agent_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity"}, agent_arg="name_hint", project_arg="project_key")
     async def create_agent_identity(
