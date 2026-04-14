@@ -1907,7 +1907,7 @@ Common variables you may set:
 | `CONTACT_AUTO_TTL_SECONDS` | `86400` | TTL for auto-approved contacts (1 day) |
 | `CONTACT_AUTO_RETRY_ENABLED` | `true` | Auto-retry contact requests on policy violations |
 | `MESSAGING_AUTO_REGISTER_RECIPIENTS` | `true` | Automatically create missing local recipients during `send_message` and retry routing |
-| `MESSAGING_AUTO_HANDSHAKE_ON_BLOCK` | `true` | When contact policy blocks delivery, attempt a contact handshake (auto-accept) and retry |
+| `MESSAGING_AUTO_HANDSHAKE_ON_BLOCK` | `false` | **Deprecated.** When `true`, silently attempts a contact handshake (auto-accept) if delivery is blocked by contact policy. Flipped to `false` by default 2026-04 for least astonishment — silent handshake-on-block is a contact-discipline anti-pattern. Explicitly setting this to `true` logs a loud startup WARNING. See `docs/deprecation-auto-contact-if-blocked.md`. |
 | `TOOLS_LOG_ENABLED` | `true` | Log tool invocations for debugging |
 | `LOG_RICH_ENABLED` | `true` | Enable Rich console logging |
 | `LOG_INCLUDE_TRACE` | `false` | Include trace-level logs |

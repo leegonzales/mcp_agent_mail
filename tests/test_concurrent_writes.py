@@ -70,8 +70,14 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_message_sends(isolated_env):
+async def test_concurrent_message_sends(isolated_env, monkeypatch):
     """Test sending multiple messages concurrently."""
+    # This test relies on the legacy silent-handshake-on-block behavior so that
+    # cross-agent sends within a single project succeed without an explicit
+    # AgentLink. The default flipped to False as of 2026-04 (least
+    # astonishment); opt back in for legacy contract.
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
+    _config.clear_settings_cache()
     settings = _config.get_settings()
     data = await _setup_project_and_agents(settings)
 
@@ -107,8 +113,11 @@ async def test_concurrent_message_sends(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_messages_to_same_thread(isolated_env):
+async def test_concurrent_messages_to_same_thread(isolated_env, monkeypatch):
     """Test multiple agents writing to the same thread concurrently."""
+    # See test_concurrent_message_sends note re: legacy silent-handshake.
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
+    _config.clear_settings_cache()
     settings = _config.get_settings()
     data = await _setup_project_and_agents(settings)
 
@@ -257,8 +266,11 @@ async def test_concurrent_file_reservation_overlapping_globs(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_inbox_fetches(isolated_env):
+async def test_concurrent_inbox_fetches(isolated_env, monkeypatch):
     """Test multiple concurrent inbox fetches."""
+    # See test_concurrent_message_sends note re: legacy silent-handshake.
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
+    _config.clear_settings_cache()
     settings = _config.get_settings()
     data = await _setup_project_and_agents(settings)
 
