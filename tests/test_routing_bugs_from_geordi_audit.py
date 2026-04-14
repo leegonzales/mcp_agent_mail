@@ -759,4 +759,3 @@ async def test_cc_and_bcc_kinds_preserved_through_resolution(isolated_env):
         assert "Adama" not in payload.get("to", []), (
             f"Adama promoted to TO from CC. payload to={payload.get('to')}"
         )
-        logger.setLevel(prior_level)

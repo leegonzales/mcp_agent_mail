@@ -4130,6 +4130,11 @@ def build_mcp_server() -> FastMCP:
                 return trimmed or value, keys, canonical
 
             unknown_local: set[str] = set()
+            # Track the original kind ("to"/"cc"/"bcc") for each unknown_local
+            # name so downstream resolution (auto-register, found_globally
+            # AgentLink) can dispatch to the correct local_to/local_cc/local_bcc
+            # bucket instead of promoting everything to TO (gemini #5).
+            unknown_local_kinds: dict[str, str] = {}
             unknown_external: dict[str, list[str]] = defaultdict(list)
 
             class _ContactBlocked(Exception):
@@ -4177,7 +4182,11 @@ def build_mcp_server() -> FastMCP:
                             label = target_project_label or "(unknown project)"
                             unknown_external[label].append(candidate.strip() or candidate)
                         else:
-                            unknown_local.add(candidate.strip() or candidate)
+                            display = candidate.strip() or candidate
+                            unknown_local.add(display)
+                            # First kind wins on dup names — tie-break ordering
+                            # to/cc/bcc by appearance in _route call order.
+                            unknown_local_kinds.setdefault(display, kind)
                         continue
 
                     # Always allow self-send (local context only)
@@ -4253,7 +4262,9 @@ def build_mcp_server() -> FastMCP:
                         label = target_project_label or "(unknown project)"
                         unknown_external[label].append(display_value or candidate.strip() or candidate)
                     else:
-                        unknown_local.add(display_value or candidate.strip() or candidate)
+                        display = display_value or candidate.strip() or candidate
+                        unknown_local.add(display)
+                        unknown_local_kinds.setdefault(display, kind)
 
             try:
                 await _route(to, "to")
@@ -4411,25 +4422,43 @@ def build_mcp_server() -> FastMCP:
                             pass
                 unknown_local.difference_update(newly_registered)
                 unknown_local.difference_update(found_globally)
-                # Re-run routing for newly registered agents
-                if newly_registered:
-                    from contextlib import suppress
-                    with suppress(_ContactBlocked):
-                        await _route(list(newly_registered), "to")
+
+                # Helper: dispatch a resolved name into the local bucket
+                # matching the kind it was originally specified in
+                # ("to"/"cc"/"bcc"). Defaults to "to" only as a last resort
+                # if kind tracking somehow missed the name (shouldn't happen
+                # under normal flow). Replaces the legacy recursive
+                # `_route(...)` re-entry which would have re-triggered the
+                # hoisted invariant against the just-created local row
+                # (gemini #3) AND silently promoted CC/BCC to TO (gemini #5).
+                def _dispatch_local(name: str) -> None:
+                    k = unknown_local_kinds.get(name, "to")
+                    if k == "cc":
+                        local_cc.append(name)
+                    elif k == "bcc":
+                        local_bcc.append(name)
+                    else:
+                        local_to.append(name)
+
+                # Auto-registered new local agents: deliver them in the
+                # original kind, no recursion into _route.
+                for name in sorted(newly_registered):
+                    _dispatch_local(name)
+
                 # For globally-found (AgentLink-approved) recipients, add
-                # directly to local_to — _persist_message resolves via
-                # _get_agent_global. Dedup against external to prevent
-                # double delivery (review C1). Runs regardless of
-                # auto-register config.
+                # to the appropriate local bucket — _persist_message
+                # resolves via _get_agent_global. Dedup against external
+                # to prevent double delivery (review C1). Runs regardless
+                # of auto-register config.
                 if found_globally:
                     external_names = {
                         nm.lower()
                         for group in external.values()
                         for nm in group.get("to", []) + group.get("cc", []) + group.get("bcc", [])
                     } if external else set()
-                    for name in found_globally:
+                    for name in sorted(found_globally):
                         if name.lower() not in external_names:
-                            local_to.append(name)
+                            _dispatch_local(name)
                 # Attempt cross-project handshakes for unknown external recipients if allowed
                 attempted_external: list[str] = []
                 try:
