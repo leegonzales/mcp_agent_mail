@@ -54,3 +54,69 @@ async def test_list_agents_returns_local_and_shadow_candidates(isolated_env):
     ), f"expected Bob flagged as shadow_candidate, got: {payload['shadow_candidates']}"
     # Alice is not a shadow candidate (unique to fake-a)
     assert all(s["name"] != "Alice" for s in payload["shadow_candidates"])
+
+
+@pytest.mark.asyncio
+async def test_list_agents_shadow_spanning_multiple_other_projects(isolated_env):
+    """A local agent name that also exists in TWO+ other projects must be
+    listed as a shadow_candidate once with both project slugs in `also_at`,
+    deterministically sorted."""
+    await ensure_schema()
+    async with get_session() as s:
+        p_home = Project(slug="p-home", human_key="P-Home")
+        p_x = Project(slug="p-x", human_key="P-X")
+        p_y = Project(slug="p-y", human_key="P-Y")
+        p_z = Project(slug="p-z", human_key="P-Z")
+        s.add_all([p_home, p_x, p_y, p_z])
+        await s.commit()
+        await s.refresh(p_home)
+        await s.refresh(p_x)
+        await s.refresh(p_y)
+        await s.refresh(p_z)
+        s.add_all([
+            Agent(project_id=p_home.id, name="Echo",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_x.id, name="Echo",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_y.id, name="Echo",
+                  program="claude-code", model="opus", task_description=""),
+            Agent(project_id=p_z.id, name="Unrelated",
+                  program="claude-code", model="opus", task_description=""),
+        ])
+        await s.commit()
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        result = await client.call_tool("list_agents", {"project_key": "p-home"})
+
+    payload = result.data if hasattr(result, "data") else result
+    echo_shadows = [s for s in payload["shadow_candidates"] if s["name"] == "Echo"]
+    assert len(echo_shadows) == 1, f"expected exactly one Echo shadow entry, got {echo_shadows}"
+    also_at = echo_shadows[0]["also_at"]
+    # Contains both p-x and p-y, excludes p-home (local) and p-z (different name).
+    assert "p-x" in also_at, also_at
+    assert "p-y" in also_at, also_at
+    assert "p-home" not in also_at
+    assert "p-z" not in also_at
+    # Deterministic ordering.
+    assert also_at == sorted(also_at), f"also_at not sorted: {also_at}"
+
+
+@pytest.mark.asyncio
+async def test_list_agents_empty_project_returns_empty_lists(isolated_env):
+    """Project with zero local agents returns empty `local` and empty
+    `shadow_candidates` without crashing (regression guard for bulk-query
+    refactor that assumed non-empty agent list)."""
+    await ensure_schema()
+    async with get_session() as s:
+        p = Project(slug="p-empty", human_key="P-Empty")
+        s.add(p)
+        await s.commit()
+
+    server = build_mcp_server()
+    async with Client(server) as client:
+        result = await client.call_tool("list_agents", {"project_key": "p-empty"})
+
+    payload = result.data if hasattr(result, "data") else result
+    assert payload["local"] == []
+    assert payload["shadow_candidates"] == []

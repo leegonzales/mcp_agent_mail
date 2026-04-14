@@ -3436,20 +3436,34 @@ def build_mcp_server() -> FastMCP:
             )
             local_agents = list(local_rows.scalars().all())
 
+            # Single bulk query for shadow candidates: find every other
+            # project where any of our local names also lives. Previously
+            # ran one query per local agent (N+1); now one query total.
             shadow_candidates: list[dict[str, Any]] = []
-            for a in local_agents:
+            if local_agents:
+                local_names_lower = [a.name.lower() for a in local_agents]
                 other_rows = await session.execute(
-                    select(Project.slug, Project.human_key)
+                    select(Project.slug, Agent.name)
                     .join(Agent, cast(Any, Agent.project_id == Project.id))
                     .where(
-                        cast(Any, func.lower(Agent.name) == a.name.lower()),
+                        cast(Any, func.lower(Agent.name).in_(local_names_lower)),
                         cast(Any, Project.id != project.id),
                     )
                     .order_by(Project.slug)
                 )
-                also_at = [slug for (slug, _hk) in other_rows.all()]
-                if also_at:
-                    shadow_candidates.append({"name": a.name, "also_at": also_at})
+                buckets: dict[str, list[str]] = {}
+                for proj_slug, agent_name in other_rows.all():
+                    buckets.setdefault(agent_name.lower(), []).append(proj_slug)
+                # Preserve local-order (alphabetical by Agent.name) and
+                # original-case agent name in the output.
+                for a in local_agents:
+                    also_at = buckets.get(a.name.lower(), [])
+                    if also_at:
+                        # Dedup + deterministic order (bulk query already
+                        # orders by Project.slug, but duplicate matches can
+                        # occur if the same project has two case-variants).
+                        deduped = sorted(set(also_at))
+                        shadow_candidates.append({"name": a.name, "also_at": deduped})
 
         await ctx.info(
             f"list_agents '{project.human_key}' -> {len(local_agents)} local, "
