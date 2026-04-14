@@ -4289,10 +4289,16 @@ def build_mcp_server() -> FastMCP:
                     hit_agent_ids: list[int] = []
                     async with get_session() as s_scan:
                         # (1) Single bulk lookup for ALL unknown_local names.
+                        # Exclude the sender's own project — local agents are
+                        # legitimate locally and must never be flagged as
+                        # globally_unlinked (Gemini round-3 #1).
                         rows = await s_scan.execute(
                             select(Agent, Project)
                             .join(Project, cast(Any, Project.id == Agent.project_id))
-                            .where(cast(Any, func.lower(Agent.name).in_(lowered_names)))
+                            .where(
+                                cast(Any, func.lower(Agent.name).in_(lowered_names)),
+                                cast(Any, Project.id != project.id),
+                            )
                             .order_by(Project.slug)
                         )
                         for agent_row, proj_row in rows.all():
