@@ -433,3 +433,65 @@ async def test_recipient_not_found_lists_all_projects_where_name_exists(isolated
     )
     assert dax_sugg is not None, suggested
     assert dax_sugg["arguments"]["to_project"] == found[0]
+
+
+def test_messaging_auto_handshake_on_block_defaults_false(isolated_env, monkeypatch):
+    """Least astonishment: the server-side silent-handshake-on-block knob
+    defaults to False. Flipping an env var to True is the only way to
+    re-enable the anti-pattern; doing so must log a loud startup WARNING
+    naming the setting."""
+    import logging
+    from mcp_agent_mail.config import get_settings, clear_settings_cache
+
+    # Default (nothing set)
+    monkeypatch.delenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", raising=False)
+    clear_settings_cache()
+    settings = get_settings()
+    assert settings.messaging_auto_handshake_on_block is False, (
+        "default must be False for least astonishment — silent handshake is "
+        "an anti-pattern that erodes contact discipline"
+    )
+
+    # Operator opts back in: must log a loud WARNING
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "true")
+    clear_settings_cache()
+    caplog_logger = logging.getLogger("mcp_agent_mail.config")
+    # Re-load settings and capture warnings
+    with _capture_logs(caplog_logger) as records:
+        settings2 = get_settings()
+    assert settings2.messaging_auto_handshake_on_block is True
+    warns = [
+        r for r in records
+        if r.levelno >= logging.WARNING
+        and "messaging_auto_handshake_on_block" in r.getMessage().lower()
+        and ("deprecated" in r.getMessage().lower()
+             or "anti-pattern" in r.getMessage().lower()
+             or "silent" in r.getMessage().lower())
+    ]
+    assert warns, (
+        f"re-enabling must log a loud WARNING. "
+        f"records: {[(r.levelname, r.getMessage()) for r in records]}"
+    )
+
+
+import contextlib
+import logging as _logging
+
+
+@contextlib.contextmanager
+def _capture_logs(logger):
+    records: list[_logging.LogRecord] = []
+
+    class _Handler(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    h = _Handler(level=_logging.DEBUG)
+    logger.addHandler(h)
+    prior_level = logger.level
+    logger.setLevel(_logging.DEBUG)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(h)
+        logger.setLevel(prior_level)
